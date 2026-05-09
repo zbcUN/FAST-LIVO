@@ -1,0 +1,271 @@
+IMU处理过程总共分六步：
+1. IMU回调入缓存
+2. 与激光/图像做时间同步，组装成LidarMeasureGroup
+3. 主循环调用Process2
+4. 若未初始化先做IMU_init
+5. 初始化后进入UndistortPcl：前向传播状态与协方差 + 反向逐点去畸变
+6. 输出更新后的状态和去畸变点云给后端匹配
+
+====================
+第2步详细说明：IMU如何和激光/图像同步成一包
+====================
+
+同步入口函数：sync_packages(meas)
+输出对象：LidarMeasureGroup meas
+
+一、这个函数要解决什么问题
+传感器是异步到达的：
+- lidar_buffer里是整帧激光点云
+- imu_buffer里是高频IMU流
+- img_buffer里是相机帧
+
+滤波/去畸变每次需要的是“一段时间窗内的IMU”，所以必须把连续IMU流切片，按当前处理时刻打包成MeasureGroup，再挂到meas.measures里。
+
+二、函数执行前后的核心状态
+输入侧关键缓存：
+- lidar_buffer, time_buffer
+- imu_buffer
+- img_buffer, img_time_buffer
+
+输出侧关键字段：
+- meas.lidar
+- meas.lidar_beg_time
+- meas.measures.back().imu
+- meas.measures.back().img_offset_time (有图像时)
+- meas.is_lidar_end
+
+三、同步流程按代码分支展开
+
+0) 早退和清理
+- 如果lidar和img都空，直接return false。
+- 如果上一轮已经到达激光末尾(meas.is_lidar_end == true)，先清空meas.measures，并把is_lidar_end置回false，开始新一轮打包。
+
+1) 先“锁定一帧激光”作为当前主时间轴
+- 当lidar_pushed == false时，从lidar_buffer.front()取当前帧到meas.lidar。
+- 对meas.lidar按点内时间排序。
+- 记录激光起始时刻：meas.lidar_beg_time = time_buffer.front()
+- 计算激光结束时刻：
+	lidar_end_time = lidar_beg_time + last_point.curvature/1000
+- 置lidar_pushed = true，表示当前正在处理这帧激光。
+
+2) 情况A：没有图像输入(img_buffer.empty)
+- 要求IMU至少覆盖到激光末尾：last_timestamp_imu >= lidar_end_time + 0.02
+- 从imu_buffer头部开始弹出，直到时间超过lidar_end_time为止。
+- 弹出的这段IMU放入一个MeasureGroup m.imu。
+- 然后把当前激光帧从lidar_buffer/time_buffer弹出。
+- 标记：
+	- lidar_pushed = false (这帧处理完)
+	- meas.is_lidar_end = true (这是“激光末尾时刻”的一次更新)
+- 把m push到meas.measures，return true。
+
+3) 情况B：有图像，但图像时间晚于激光末尾
+条件：img_time_buffer.front() > lidar_end_time
+
+这说明当前应先完成“激光末尾更新”，流程和情况A几乎一样：
+- 从imu_buffer截取到lidar_end_time
+- 弹出当前激光帧
+- meas.is_lidar_end = true
+- m push到meas.measures
+
+4) 情况C：有图像，且图像时间落在当前激光扫描内部
+条件：img_time_buffer.front() <= lidar_end_time
+
+这时不是激光末尾更新，而是“扫描中途的图像时刻更新”：
+- 令img_start_time = img_time_buffer.front()
+- 要求IMU覆盖到img_start_time：last_timestamp_imu >= img_start_time
+- 从imu_buffer截取到img_start_time
+- 写入：
+	- m.imu = 这段IMU
+	- m.img = 当前图像
+	- m.img_offset_time = img_start_time - meas.lidar_beg_time
+- 弹出这张图像(img_buffer/img_time_buffer pop_front)
+- 标记meas.is_lidar_end = false（说明还在这一帧激光内部）
+- m push到meas.measures
+
+四、为什么要is_lidar_end这个标志
+- is_lidar_end = false：本次是扫描中间时刻更新（通常用于图像辅助更新），激光帧还没结束。
+- is_lidar_end = true：本次是激光末尾更新，这帧激光完成，可进入整帧去畸变/完整激光处理路径。
+
+五、这一步对后端的直接价值
+sync_packages做完后，后端不再面对“连续异步流”，而是面对“已切好时间窗的数据包”：
+- 一段严格对应当前更新时刻的IMU
+- 当前激光帧基准时间(lidar_beg_time)
+- 可选图像偏移时间(img_offset_time)
+- 是否到激光末尾(is_lidar_end)
+
+这样Process2/UndistortPcl就可以稳定地做：
+- 前向传播到目标时刻（图像时刻或激光末尾）
+- 在激光末尾时执行完整去畸变
+激光一帧开始 ---------------------------------------- 激光一帧结束
+[时间区间 t0 ~ t1]
+
+     图1       图2       图3       图4      （图像）
+   ↓        ↓        ↓        ↓
+[IMU,IMU][IMU,IMU][IMU,IMU][IMU,IMU]  （图像之间的IMU）
+└───┬───┘└───┬───┘└───┬───┘└───┬───┘
+  组1      组2      组3      组4      （MeasureGroup）
+└──────────────────────────────────┘
+          全部放进 measures 队列
+└──────────────────────────────────┘
+          属于这一帧激光的数据
+
+====================
+第3步详细说明：主循环调用Process2做了什么
+====================
+
+一、Process2是哪个函数
+Process2是非IKFoM分支下的IMU处理入口函数：
+- 函数名：ImuProcess::Process2
+- 位置：src/IMU_Processing.cpp
+- 调用点：主循环在sync_packages成功后调用Process2
+
+二、Process2的输入和输出
+输入：
+- lidar_meas（LidarMeasureGroup）：当前已同步好的一包数据
+- stat（StatesGroup）：当前状态先验（姿态、位置、速度、偏置、协方差）
+- cur_pcl_un_（PointCloud指针）：用于承接去畸变后的点云
+
+输出：
+- 更新后的stat（在函数内部原地修改）
+- 去畸变点云写入*cur_pcl_un_
+
+三、Process2主流程（按代码执行顺序）
+
+1) 基础检查
+- 先确认lidar_meas.lidar非空
+- 取当前要处理的测量组：meas = lidar_meas.measures.back()
+
+2) 初始化分支（只在系统起始阶段触发）
+- 条件：imu_need_init_为true
+- 若当前meas里没有IMU，直接return，等待下一包
+- 有IMU则调用IMU_init(meas, stat, init_iter_num)
+- 初始化未完成前，函数直接return，不做去畸变
+
+这里的意义：
+- 用起始几包IMU估计重力方向、偏置和噪声统计量
+- 没有这些先验时，直接积分会漂得很快
+
+3) 正常分支（初始化完成后）
+- 直接调用UndistortPcl(lidar_meas, stat, *cur_pcl_un_)
+
+也就是说，Process2本体是一个“状态机入口”：
+- 初始化期：只做IMU_init
+- 运行期：转交UndistortPcl做真正的前向传播+去畸变
+
+四、为什么主循环要先sync_packages再Process2
+因为Process2假设输入已经是“时间对齐后的数据包”，而不是原始异步流。
+
+sync_packages负责：
+- 切好本次更新所需IMU时间窗
+- 标注本次是图像中途更新还是激光帧末更新
+
+Process2/UndistortPcl负责：
+- 用这段IMU把状态传播到目标时刻
+- 若到达激光帧末，完成整段点云去畸变
+
+五、和第2步、第5步的关系
+- 第2步是数据组织层（切片打包）
+- 第3步是流程调度层（决定当前走初始化还是去畸变）
+- 第5步是算法计算层（Forward/Backward或UndistortPcl内部数学传播）
+
+可以把Process2理解为“IMU处理总开关”，自己不做太多数值细节，但决定每一包数据进入哪条处理路径。
+
+====================
+第5步详细说明：UndistortPcl(611-737)前半段在做什么
+====================
+
+说明：这一段是非IKFoM分支的核心，完成两件事：
+- 先把本次要处理的点云时间段取出来
+- 再用IMU做前向传播，得到这一段对应的状态轨迹(IMUpose)
+
+一、函数输入与角色
+- lidar_meas：第2步sync_packages打包好的时间窗数据
+- state_inout：当前状态先验，函数内会被更新
+- pcl_out：输出点云片段（后续将被去畸变）
+
+二、先把IMU序列补齐成连续时间段
+1) 取本次测量组：meas = lidar_meas.measures.back()
+2) 复制本次IMU子序列：v_imu = meas.imu
+3) 在头部补一个上一段末尾IMU：v_imu.push_front(last_imu_)
+
+这样做的目的：
+- 当前段第一小步积分也需要“前后两个IMU点”
+- 用last_imu_补头可以避免第一小段缺失
+
+三、确定本次点云处理时间窗
+1) pcl_beg_time = max(lidar_beg_time, last_update_time)
+- 含义：如果同一帧激光被多次中途更新（例如图像触发），本次从上次处理到的位置继续
+
+2) pcl_end_time分两种：
+- 若is_lidar_end=true：到激光帧末时间
+- 若is_lidar_end=false：到当前图像时刻(lidar_beg_time + img_offset_time)
+
+3) 按时间从原始激光帧中截取本次片段
+- 从lidar_scan_index_now开始往后取点
+- 条件：点内时间curvature <= 本次offset上限
+- 取出的点push到pcl_out
+
+4) 更新游标和时间戳
+- lidar_meas.last_update_time = pcl_end_time
+- 如果本次到帧末(is_lidar_end=true)，把lidar_scan_index_now清零，下一帧重新开始
+
+结论：
+- 这一步把“整帧点云”切成“本次时间段点云片段”
+
+四、初始化IMU轨迹容器IMUpose
+1) IMUpose.clear()
+2) 先压入offset=0的起点状态：
+- 姿态：state_inout.rot_end
+- 速度：state_inout.vel_end
+- 位置：state_inout.pos_end
+- 加速度/角速度：沿用上次保存的acc_s_last, angvel_last
+
+作用：
+- 给后续每个IMU小段积分提供轨迹起点
+- 给后半段反向去畸变提供离散轨迹查表
+
+五、前向传播主循环（核心）
+循环单位：相邻IMU对(head, tail)
+
+1) 旧数据裁剪
+- 若tail时间早于last_lidar_end_time_，跳过
+- 目的是避免对已经处理过的时间段重复积分
+
+2) 中值积分输入
+- 角速度取head与tail平均
+- 加速度取head与tail平均
+
+3) 去偏置与尺度归一
+- 角速度减gyro bias
+- 加速度按g/mean_acc.norm做尺度归一后减acc bias
+
+4) 计算dt
+- 常规dt = t_tail - t_head
+- 若head早于last_lidar_end_time_，则dt从last_lidar_end_time_算起
+
+5) 协方差传播
+- 构造状态转移矩阵F_x和噪声矩阵cov_w
+- 更新：state_inout.cov = F_x * cov * F_x^T + cov_w
+
+6) 名义状态传播
+- 姿态：R_imu = R_imu * Exp(omega, dt)
+- 世界系加速度：acc_imu = R_imu * acc_avr + gravity
+- 位置：pos_imu = pos_imu + vel_imu*dt + 0.5*acc_imu*dt^2
+- 速度：vel_imu = vel_imu + acc_imu*dt
+
+7) 保存轨迹点
+- 更新angvel_last和acc_s_last
+- 记录该时刻offset_t = t_tail - pcl_beg_time
+- push到IMUpose
+
+到这里(611-737结束)完成的是：
+- 本次点云片段的时间裁剪
+- IMU前向传播与协方差更新
+- 生成用于去畸变的离散轨迹IMUpose
+
+六、这段与后续代码的衔接
+- 紧接着(737之后)会把状态外推到pcl_end_time并写回state_inout
+- 再利用IMUpose做反向逐点补偿，把pcl_out中的每个点统一到目标时刻
+
+所以你选中的611-737这段可以理解为：
+“先搭好时间窗和状态轨迹，准备去畸变”。

@@ -84,19 +84,23 @@ class ImuProcess
   #endif
 
   PointCloudXYZI::Ptr cur_pcl_un_;
+  /// 上一处理窗口末尾的 IMU 测量（与当前 meas.imu 首条衔接）；构造/Reset 时为空占位消息
   sensor_msgs::ImuConstPtr last_imu_;
   deque<sensor_msgs::ImuConstPtr> v_imu_;
+  /// 与 IMU 采样对齐的位姿序列，offset_time 相对本帧 pcl_beg_time（秒）
   vector<Pose6D> IMUpose;
   vector<M3D>    v_rot_pcl_;
   M3D Lid_rot_to_IMU;
   V3D Lid_offset_to_IMU;
   V3D mean_acc;
   V3D mean_gyr;
+  /// 上一 IMU 段末端角速度、比力（去偏/已转世界系），用于 IMUpose 首节点与跨帧连续
   V3D angvel_last;
   V3D acc_s_last;
   V3D last_acc;
   V3D last_ang;
   double start_timestamp_;
+  /// 上一帧已处理点云的时间上界（秒）；用于丢弃已积分过的 IMU 段、以及跨帧 dt 截断
   double last_lidar_end_time_;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;

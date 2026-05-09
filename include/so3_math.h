@@ -35,7 +35,7 @@ Eigen::Matrix<T, 3, 3> Exp(const Eigen::Matrix<T, 3, 1> &ang_vel, const Ts &dt)
 
     if (ang_vel_norm > 0.0000001)
     {
-        Eigen::Matrix<T, 3, 1> r_axis = ang_vel / ang_vel_norm;
+        Eigen::Matrix<T, 3, 1> r_axis = ang_vel / ang_vel_norm;//角速度方向就是 瞬时旋转轴（右手系：四指绕轴，大拇指沿 角速度方向）
         Eigen::Matrix<T, 3, 3> K;
 
         K << SKEW_SYM_MATRX(r_axis);
@@ -49,8 +49,9 @@ Eigen::Matrix<T, 3, 3> Exp(const Eigen::Matrix<T, 3, 1> &ang_vel, const Ts &dt)
     {
         return Eye3;
     }
-}
-
+}//先分解成绕那里旋转和转多少度，然后根据罗德里格斯公式计算旋转矩阵
+//轻松实现旋转速度积分到旋转矩阵的转换
+//李代数优势的完全体现
 template<typename T>
 Eigen::Matrix<T, 3, 3> Exp(const T &v1, const T &v2, const T &v3)
 {
