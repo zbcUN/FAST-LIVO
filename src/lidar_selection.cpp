@@ -343,26 +343,36 @@ void LidarSelector::createPatchFromPatchWithBorder(float* patch_with_border, flo
 }
 #endif
 
+// 从全局稀疏图 feat_map 中筛选「当前帧可见且与当前点云几何一致」的地图点，填充 sub_sparse_map / sub_map_cur_frame_，
+// 供后续 ComputeJ 做块对齐。分三步：① 当前帧点云扫体素 + 投影像素深度图；② 与 feat_map 求交并在图像网格上提名点；
+// ③ 深度一致 + 参考 patch warp + 当前 patch 检验后入 sub_sparse_map。
 void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
 {
     if(feat_map.size()<=0) return;
     // double ts0 = omp_get_wtime();
 
+    // 下采样当前帧点云 pg，减轻后续投影与体素统计量。
     pg_down->reserve(feat_map.size());
     downSizeFilter.setInputCloud(pg);
     downSizeFilter.filter(*pg_down);
     
+    // grid_num / map_dist / voxel_points_ 等由 reset_grid 初始化；map_value 单独清零供本函数写入选点质量。
     reset_grid();
     memset(map_value, 0, sizeof(float)*length);
 
+    // 本帧待构建的「子稀疏图」与当前帧子地图点列表清空。
     sub_sparse_map->reset();
     deque< PointPtr >().swap(sub_map_cur_frame_);
 
+    // 与 feat_map 一致的体素边长：用于判断「当前帧几何」经过了哪些体素键。
     float voxel_size = 0.5;
     
+    // sub_feat_map：本帧点云占据的体素集合（键），用于与 feat_map 求交，避免遍历整张地图。
+    // Warp_map：按参考特征 id 缓存仿射形变 A 与金字塔搜索层，避免同一 ref 重复计算。
     unordered_map<VOXEL_KEY, float>().swap(sub_feat_map);
     unordered_map<int, Warp*>().swap(Warp_map);
 
+    // 稀疏深度图：下采样点投到当前相机后，在像素位置写入相机系 z（多写同一像素则后者覆盖）。
     cv::Mat depth_img = cv::Mat::zeros(height, width, CV_32FC1);
     float* it = (float*)depth_img.data;
 
@@ -374,12 +384,13 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
     // printf("A0. initial depthmap: %.6lf \n", omp_get_wtime() - ts0);
     // double ts1 = omp_get_wtime();
 
+    // ---------- 第一步：当前帧点云 → 体素键 sub_feat_map + 投影像素深度 depth_img ----------
     for(int i=0; i<pg_down->size(); i++)
     {
-        // Transform Point to world coordinate
+        // pg 与地图一致为世界系坐标（见 laserMapping 传入方式）。
         V3D pt_w(pg_down->points[i].x, pg_down->points[i].y, pg_down->points[i].z);
 
-        // Determine the key of hash table      
+        // 体素索引：floor(pt / voxel_size)，与 feat_map 中 VoxelOcto 的键一致。
         for(int j=0; j<3; j++)
         {
             loc_xyz[j] = floor(pt_w[j] / voxel_size);
@@ -392,14 +403,17 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
             sub_feat_map[position] = 1.0;
         }
                     
+        // 世界点 → 当前帧相机系（T_f_w * p_w），用于深度检验与投影。
         V3D pt_c(new_frame_->w2f(pt_w));
 
         V2D px;
         if(pt_c[2] > 0)
         {
+            // 针孔投影到像素平面（与 Frame 内 cam 模型一致时使用 fx,fy,cx,cy）。
             px[0] = fx * pt_c[0]/pt_c[2] + cx;
             px[1] = fy * pt_c[1]/pt_c[2] + cy;
 
+            // 留出 patch 边界，避免后续 getpatch 越界。
             if(new_frame_->cam_->isInFrame(px.cast<int>(), (patch_size_half+1)*8))
             {
                 float depth = pt_c[2];
@@ -420,6 +434,7 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
 
     // double t1 = omp_get_wtime();
 
+    // ---------- 第二步：sub_feat_map 与全局 feat_map 求交；地图点投到图像格，每格保留距离相机较近的代表点 ----------
     for(auto& iter : sub_feat_map)
     {   
         VOXEL_KEY position = iter.first;
@@ -444,6 +459,7 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
       
                 if(new_frame_->cam_->isInFrame(pc.cast<int>(), (patch_size_half+1)*8)) // 20px is the patch size in the matcher
                 {
+                    // 图像平面分格：同一格内多个地图点竞争一个 voxel_points_[index]（按与相机距离）。
                     int index = static_cast<int>(pc[0]/grid_size)*grid_n_height + static_cast<int>(pc[1]/grid_size);
                     grid_num[index] = TYPE_MAP;
                     Vector3d obs_vec(new_frame_->pos() - pt->pos_);
@@ -457,6 +473,7 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
                         voxel_points_[index] = pt;
                     } 
 
+                    // 同时维护该格最大纹理分数（与 addSparseMap 中 pt->value 含义一致）；注意与上面「最近点」非同一条件，可能略不一致。
                     if (cur_value >= map_value[index])
                     {
                         map_value[index] = cur_value;
@@ -473,6 +490,7 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
     double t_2, t_3, t_4, t_5;
     t_2=t_3=t_4=t_5=0;
 
+    // ---------- 第三步：对每格候选点做 LiDAR 深度一致、参考 patch 仿射 warp、与当前图 patch 误差，通过则加入 sub_sparse_map ----------
     for (int i=0; i<length; i++) 
     { 
         if (grid_num[i]==TYPE_MAP) //&& map_value[i]>10)
@@ -486,6 +504,7 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
             V2D pc(new_frame_->w2c(pt->pos_));
             V3D pt_cam(new_frame_->w2f(pt->pos_));
    
+            // 地图点深度 vs 邻域 depth_img（来自当前帧点云投影）：差过大则认为与当前扫描几何冲突，丢弃（变量名沿用原拼写 depth_continous）。
             bool depth_continous = false;
             for (int u=-patch_size_half; u<=patch_size_half; u++)
             {
@@ -515,10 +534,12 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
             
             FeaturePtr ref_ftr;
 
+            // 在点 pt 的多帧观测中选与当前相机位姿、投影 pc 最匹配的参考特征（含历史图像与 patch）。
             if(!pt->getCloseViewObs(new_frame_->pos(), ref_ftr, pc)) continue;
 
             // t_3 += omp_get_wtime() - t_1;
 
+            // 经仿射 warp 后的参考 patch 像素缓冲（长度 patch_size_total*3，灰度路径下仍按块布局使用）。
             std::vector<float> patch_wrap(patch_size_total * 3);
 
             // patch_wrap = ref_ftr->patch;
@@ -536,6 +557,7 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
             }
             else
             {
+                // 参考帧 → 当前帧的仿射近似（视角变化）；T_cur_ref = new_frame_->T_f_w_ * ref_ftr->T_f_w_^{-1}。
                 getWarpMatrixAffine(*cam, ref_ftr->px, ref_ftr->f, (ref_ftr->pos() - pt->pos_).norm(), 
                 new_frame_->T_f_w_ * ref_ftr->T_f_w_.inverse(), 0, 0, patch_size_half, A_cur_ref_zero);
                 
@@ -549,11 +571,13 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
 
             // t_1 = omp_get_wtime();
 
+            // 多尺度 warp：把参考图像 ref_ftr->img 上的 patch 变换到与当前帧 appearance 对齐，写入 patch_wrap。
             for(int pyramid_level=0; pyramid_level<=2; pyramid_level++)
             {                
                 warpAffine(A_cur_ref_zero, ref_ftr->img, ref_ftr->px, ref_ftr->level, search_level, pyramid_level, patch_size_half, patch_wrap.data());
             }
 
+            // 当前灰度图 img 在投影 pc 处取同样大小的 patch，写入 patch_cache。
             getpatch(img, pc, patch_cache.data(), 0);
 
             if(ncc_en)
@@ -562,6 +586,7 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
                 if(ncc < ncc_thre) continue;
             }
 
+            // 粗对齐残差：warp 后参考 patch 与当前 patch 逐像素平方和；过大则视为外点。
             float error = 0.0;
             for (int ind=0; ind<patch_size_total; ind++) 
             {
@@ -571,6 +596,7 @@ void LidarSelector::addFromSparseMap(cv::Mat img, PointCloudXYZI::Ptr pg)
             
             sub_map_cur_frame_.push_back(pt);
 
+            // 与 sub_sparse_map 各并行数组一一对应，供 ComputeJ / align2D 使用。
             sub_sparse_map->propa_errors.push_back(error);
             sub_sparse_map->search_levels.push_back(search_level);
             sub_sparse_map->errors.push_back(error);
@@ -1034,11 +1060,12 @@ void LidarSelector::detect(cv::Mat img, PointCloudXYZI::Ptr pg)
     }
     img_rgb = img.clone();
     img_cp = img.clone();
-    cv::cvtColor(img,img,CV_BGR2GRAY);
+    cv::cvtColor(img,img,CV_BGR2GRAY);//img转灰度
 
     new_frame_.reset(new Frame(cam, img.clone()));
     updateFrameState(*state);
 
+    // 首帧且点云足够：把当前帧标成关键帧（维护 key_pts_ 等），之后进入常规帧流程。
     if(stage_ == STAGE_FIRST_FRAME && pg->size()>10)
     {
         new_frame_->setKeyframe();
@@ -1047,30 +1074,37 @@ void LidarSelector::detect(cv::Mat img, PointCloudXYZI::Ptr pg)
 
     double t1 = omp_get_wtime();
 
+    // 从全局稀疏图 feat_map 里「拉回」与当前视锥/体素相交的 3D 点：下采样 pg、投到当前帧、
+    // 与已有 voxel 地图匹配，填充 sub_sparse_map / sub_map_cur_frame_，供后面块对齐用。
     addFromSparseMap(img, pg);
 
     double t3 = omp_get_wtime();
 
+    // 用当前帧点云 pg 在图像平面上分格选点（Shi-Tomasi 响应等），向稀疏图里新增可见 3D 路标点与 Feature。
     addSparseMap(img, pg);
 
     double t4 = omp_get_wtime();
     
     // computeH = ekf_time = 0.0;
     
+    // 对 sub_sparse_map 中点做 2D patch 对齐 + 迭代更新状态（UpdateState）；若残差下降会再次 updateFrameState。
     ComputeJ(img);
 
     double t5 = omp_get_wtime();
 
+    // 视运动/像素距离等条件，为地图点追加或刷新在当前帧上的观测 Feature，控制 obs_ 列表长度。
     addObservation(img);
     
     double t2 = omp_get_wtime();
     
     frame_count ++;
+    // 本帧 detect 总耗时滑动平均，用于 printf 统计。
     ave_total = ave_total * (frame_count - 1) / frame_count + (t2 - t1) / frame_count;
 
     printf("[ VIO ]: time: addFromSparseMap: %.6f addSparseMap: %.6f ComputeJ: %.6f addObservation: %.6f total time: %.6f ave_total: %.6f.\n"
     , t3-t1, t4-t3, t5-t4, t2-t5, t2-t1, ave_total);
 
+    // 在 img_cp 上画稀疏对齐 patch 位置，便于调试显示（与 laserMapping 里 img_pub 一致）。
     display_keypatch(t2-t1);
 } 
 

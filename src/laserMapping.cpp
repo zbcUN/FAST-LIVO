@@ -517,7 +517,7 @@ void img_cbk(const sensor_msgs::ImageConstPtr& msg)
     sig_buffer.notify_all();
 }
 
-bool sync_packages(LidarMeasureGroup &meas)
+bool sync_packages(LidarMeasureGroup &meas)//手动时间同步函数，把雷达和图像同步成一包。
 {
     if ((lidar_buffer.empty() && img_buffer.empty())) { // has lidar topic or img topic?
         return false;
@@ -1021,7 +1021,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         if (esti_plane(pabcd, points_near, 0.1f)) //(planeValid)
         {
             float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
+            // 点到面有符号距离 pd2
             float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+            // s：点面一致得分，1 减罚项；|pd2| 越小 s 越近 1。sqrt(r)（r=|p_body|）使近处更严、远处略宽。
+            // s>0.9 等价 |pd2| < (0.1/0.9)*sqrt(r)。1-0.9*… 与 LOAM 系习惯一致，单标量门限好调。
 
             if (s > 0.9)
             {
@@ -1288,7 +1291,7 @@ int main(int argc, char** argv)
         state_point = kf.get_x();
         pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
         #else
-        p_imu->Process2(LidarMeasures, state, feats_undistort); 
+        p_imu->Process2(LidarMeasures, state, feats_undistort); //LidarMeasures里面是视觉雷达imu，雷达扫描这一时间阿段所有收到的数据
         state_propagat = state;
         #endif
 
@@ -1317,9 +1320,24 @@ int main(int argc, char** argv)
         flg_EKF_inited = (LidarMeasures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                         false : true;
 
+
+
+                        路径	sync_packages	is_lidar_end
+        // A：无图，整圈扫尾
+        // true
+        // true
+        // B1：有图但 img_time > lidar_end_time，先封本圈雷达
+        // true
+        // true
+        // B2：有图且 img_time ≤ lidar_end_time（图落在这圈扫描时间窗内）
+        // true
+        // false                   LidarMeasures.is_lidar_end=0 这个判断就是 等一些看下帧图像让他进入B1还是B2
         if (! LidarMeasures.is_lidar_end) 
         {
             cout<<"[ VIO ]: Raw feature num: "<<pcl_wait_pub->points.size() << "." << endl;
+            // 扫未结束分支里的 VIO：在「雷达时间轴还很靠前」时先跳过，等 IMU/状态略稳定再跑 detect。
+            // first_lidar_time 在首帧有效雷达时被设为 lidar_beg_time（秒）；若 bag/仿真从 t≈0 起，则前约 10s 不进入下面 img_en；
+            // 若为 Unix 墙钟（≫10），本条件几乎恒为假，相当于不拦——是否改写成 (lidar_beg_time - first_lidar_time)<10 视数据集而定。
             if (first_lidar_time<10)
             {
                 continue;
@@ -1394,10 +1412,12 @@ int main(int argc, char** argv)
         #ifndef USE_ikdforest            
             lasermap_fov_segment();
         #endif
+        // 当前扫描去畸变点云 feats_undistort → 体素下采样得到本帧「源点」feats_down_body，供 ICP 与地图匹配。
         /*** downsample the feature points in a scan ***/
         downSizeFilterSurf.setInputCloud(feats_undistort);
         downSizeFilterSurf.filter(*feats_down_body);
     #ifdef USE_ikdtree
+        // 增量式地图：ikd-Tree / ikd-Forest 存地图点；首帧或未初始化时用本帧点建库，点数不足则本圈跳过。
         /*** initialize the map kdtree ***/
         #ifdef USE_ikdforest
         if (!ikdforest.initialized){
@@ -1420,6 +1440,7 @@ int main(int argc, char** argv)
         int featsFromMapNum = ikdtree.size();
         #endif
     #else
+        // 传统 PCL：从地图点 featsFromMap（或首帧用 feats_down_body）再下采样，得到用于近邻搜索的地图点集。
         if(featsFromMap->points.empty())
         {
             downSizeFilterMap.setInputCloud(feats_down_body);
@@ -1434,16 +1455,18 @@ int main(int argc, char** argv)
         feats_down_size = feats_down_body->points.size();
         cout<<"[ LIO ]: Raw feature num: "<<feats_undistort->points.size()<<" downsamp num "<<feats_down_size<<" Map num: "<<featsFromMapNum<< "." << endl;
 
+        // 为每个下采样特征预分配：法向/面元、世界系坐标、上一轮残差初值，后面 ICP + 迭代卡尔曼会写满。
         /*** ICP and iterated Kalman filter update ***/
         normvec->resize(feats_down_size);
         feats_down_world->resize(feats_down_size);
         //vector<double> res_last(feats_down_size, 1000.0); // initial //
-        res_last.resize(feats_down_size, 1000.0);
+        res_last.resize(feats_down_size, 1000.0);//被resize拉长时，新位置默认值是1000
         
         t1 = omp_get_wtime();
+        // 融合前日志：在 lidar_en 下把当前预测状态写入 fout_pre（与 fout_out 成对用于对比滤波前后）。
         if (lidar_en)
         {
-            euler_cur = RotMtoEuler(state.rot_end);
+            euler_cur = RotMtoEuler(state.rot_end);//姿态为最后一个imu点的姿态
             #ifdef USE_IKFOM
             //state_ikfom fout_state = kf.get_x();
             fout_pre << setw(20) << LidarMeasures.last_update_time - first_lidar_time << " " << euler_cur.transpose()*57.3 << " " << state_point.pos.transpose() << " " << state_point.vel.transpose() \
@@ -1455,6 +1478,7 @@ int main(int argc, char** argv)
         }
 
     #ifdef USE_ikdtree
+        // 调试/备用：恒为假；若打开则把 ikdtree 展平拷贝到 featsFromMap 供非增量路径使用。
         if(0)
         {
             PointVector ().swap(ikdtree.PCL_Storage);
@@ -1463,9 +1487,11 @@ int main(int argc, char** argv)
             featsFromMap->points = ikdtree.PCL_Storage;
         }
     #else
+        // 非 ikdtree：用 featsFromMap 建 PCL 的 kd-tree，后面按点半径近邻查地图。
         kdtreeSurfFromMap->setInputCloud(featsFromMap);
     #endif
 
+        // 每个源点是否参与匹配、近邻索引与邻域点集，与 feats_down_size 一一对应。
         point_selected_surf.resize(feats_down_size, true);
         pointSearchInd_surf.resize(feats_down_size);
         Nearest_Points.resize(feats_down_size);
@@ -1494,67 +1520,68 @@ int main(int argc, char** argv)
         geoQuat.w = state_point.rot.coeffs()[3];
         #else
 
-        if(img_en)
+        if(img_en) // 视觉开启时的占位：强制设 OpenMP 线程数并跑空并行循环（历史兼容/预留，对结果无实质计算）
         {
-            omp_set_num_threads(MP_PROC_NUM);
-            #pragma omp parallel for
-            for(int i=0;i<1;i++) {}
+            omp_set_num_threads(MP_PROC_NUM); // 设置本进程 OpenMP 线程数为 MP_PROC_NUM
+            #pragma omp parallel for // 并行 for；循环体为空，仅占位（与 MP_PROC_NUM 配合）
+            for(int i=0;i<1;i++) {} // 单次空迭代
         }
 
-        if(lidar_en)
+        if(lidar_en) // 仅当启用激光融合时，执行下方 ICP + 迭代卡尔曼更新
         {
+            // iterCount 从 -1 到 NUM_MAX_ITERATIONS-1：每轮做点面匹配、组 H/z、更新状态；需 EKF 已初始化
             for (iterCount = -1; iterCount < NUM_MAX_ITERATIONS && flg_EKF_inited; iterCount++) 
             {
-                match_start = omp_get_wtime();
-                PointCloudXYZI ().swap(*laserCloudOri);
-                PointCloudXYZI ().swap(*corr_normvect);
+                match_start = omp_get_wtime(); // 记录本迭代「匹配+残差」段起始时间，用于统计 match_time
+                PointCloudXYZI ().swap(*laserCloudOri); // 与空点云 swap，等价清空 laserCloudOri 内容但复用已分配内存
+                PointCloudXYZI ().swap(*corr_normvect); // 清空 corr_normvect（法向+残差打包点云）
                 // laserCloudOri->clear(); 
                 // corr_normvect->clear(); 
-                total_residual = 0.0; 
+                total_residual = 0.0; // 本迭代有效点的 |pd2| 累加和，后面算 res_mean_last
 
                 /** closest surface search and residual computation **/
-                #ifdef MP_EN
-                    omp_set_num_threads(MP_PROC_NUM);
-                    #pragma omp parallel for
+                #ifdef MP_EN // 若编译启用多线程匹配
+                    omp_set_num_threads(MP_PROC_NUM); // 为并行 for 设线程数
+                    #pragma omp parallel for // 以下按 i 并行遍历各下采样点（数据竞争依赖设计：不同 i 写不同槽位）
                 #endif
                 // normvec->resize(feats_down_size);
-                for (int i = 0; i < feats_down_size; i++)
+                for (int i = 0; i < feats_down_size; i++) // 对每个下采样特征点 i 单独做近邻与平面检验
                 {
-                    PointType &point_body  = feats_down_body->points[i];
-                    PointType &point_world = feats_down_world->points[i];
-                    V3D p_body(point_body.x, point_body.y, point_body.z);
+                    PointType &point_body  = feats_down_body->points[i]; // 体坐标系下第 i 个点（雷达系）
+                    PointType &point_world = feats_down_world->points[i]; // 世界系下同索引点（将被 pointBodyToWorld 写入）
+                    V3D p_body(point_body.x, point_body.y, point_body.z); // Eigen 三维向量，便于后面范数等运算
                     /* transform to world frame */
-                    pointBodyToWorld(&point_body, &point_world);
-                    vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
-                    #ifdef USE_ikdtree
-                        auto &points_near = Nearest_Points[i];
-                    #else
-                        auto &points_near = pointSearchInd_surf[i];
+                    pointBodyToWorld(&point_body, &point_world); // 用当前 state 将点从体坐标变换到世界系，供地图搜索  位姿在全局变量
+                    vector<float> pointSearchSqDis(NUM_MATCH_POINTS); // 存 K 近邻各点距离平方，供阈值判断 找最近的5个点
+                    #ifdef USE_ikdtree // 增量地图：近邻结果存实际点
+                        auto &points_near = Nearest_Points[i]; // 第 i 个点对应的近邻点集（PointVector）  操作这个&points_near 就是操作这个Nearest_Points[i]这个点集了
+                    #else // PCL kd-tree：近邻存地图点索引
+                        auto &points_near = pointSearchInd_surf[i]; // 第 i 个点对应的 K 近邻索引 vector<int>
                     #endif
-                    uint8_t search_flag = 0;  
-                    double search_start = omp_get_wtime();
-                    if (nearest_search_en)
+                    uint8_t search_flag = 0;   // ikdforest 搜索状态标志，0 表示正常
+                    double search_start = omp_get_wtime(); // 近邻搜索耗时统计起点
+                    if (nearest_search_en) // 本迭代是否执行 kNN（rematch 策略会间歇置 true）
                     {
                         /** Find the closest surfaces in the map **/
-                        #ifdef USE_ikdtree
+                        #ifdef USE_ikdtree // 使用 ikdtree 或 ikdforest
                             #ifdef USE_ikdforest
-                                search_flag = ikdforest.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis, first_lidar_time, 5);
+                                search_flag = ikdforest.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis, first_lidar_time, 5); // 森林近邻搜索
                             #else
-                                ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+                                ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis); // 单树 K 近邻（只运行了这一条）
                             #endif
                         #else
-                            kdtreeSurfFromMap->nearestKSearch(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+                            kdtreeSurfFromMap->nearestKSearch(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis); // PCL 在地图点云上 K 近邻
                         #endif
 
-                        point_selected_surf[i] = pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
+                        point_selected_surf[i] = pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true; // 最远邻距平方>5 则认为邻域差，不参与
 
                         #ifdef USE_ikdforest
-                            point_selected_surf[i] = point_selected_surf[i] && (search_flag == 0);
+                            point_selected_surf[i] = point_selected_surf[i] && (search_flag == 0); // 森林路径需搜索成功标志
                         #endif
-                        kdtree_search_time += omp_get_wtime() - search_start;
-                        kdtree_search_counter ++;                        
+                        kdtree_search_time += omp_get_wtime() - search_start; // 累加近邻搜索耗时
+                        kdtree_search_counter ++;                         // 近邻搜索次数计数
                     }
-
+                    //自此每个点都找到了最近的5个点
 
                     // if (!point_selected_surf[i]) continue;
 
@@ -1564,171 +1591,176 @@ int main(int argc, char** argv)
                     //     printf("\nERROR: Return Points is less than 5\n\n");
                     //     printf("Target Point is: (%0.3f,%0.3f,%0.3f)\n",point_world.x,point_world.y,point_world.z);
                     // }
-                    if (!point_selected_surf[i] || points_near.size() < NUM_MATCH_POINTS) continue;
+                    if (!point_selected_surf[i] || points_near.size() < NUM_MATCH_POINTS) continue; // 未通过近邻筛选或邻域点数不足则跳过
 
-                    VF(4) pabcd;
-                    point_selected_surf[i] = false;
-                    if (esti_plane(pabcd, points_near, 0.1f)) //(planeValid)
+                    VF(4) pabcd; // 局部平面系数 n·x+d=0 的 (a,b,c,d) 或等价存储
+                    point_selected_surf[i] = false; // 先标为无效，拟合成功且通过 s 门限再置 true
+                    if (esti_plane(pabcd, points_near, 0.1f)) //(planeValid) // 用邻域点拟合平面，阈值 0.1 0.1是判断是不是平面
                     {
                         float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
+                        // 点到面有符号距离 pd2
                         float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+                        // s：点面一致得分，1 减与 |pd2|/sqrt(r) 成正比的罚项（r=|p_body|）；|pd2| 越小 s 越近 1，近处 r 小更严。
+                        // s>0.9 等价 |pd2| < (0.1/0.9)*sqrt(r)。用 1-0.9*… 非直接 if(|pd2|<…)，与 LOAM 系一致、单门限好调。
 
-                        if (s > 0.9)
+                        if (s > 0.9) // 门限：平面约束足够可靠
                         {
-                            point_selected_surf[i] = true;
-                            normvec->points[i].x = pabcd(0);
-                            normvec->points[i].y = pabcd(1);
-                            normvec->points[i].z = pabcd(2);
-                            normvec->points[i].intensity = pd2;
-                            res_last[i] = abs(pd2);
+                            point_selected_surf[i] = true; // 该点本迭代参与后续紧支集
+                            normvec->points[i].x = pabcd(0); // 存平面法向 nx
+                            normvec->points[i].y = pabcd(1); // ny
+                            normvec->points[i].z = pabcd(2); // nz
+                            normvec->points[i].intensity = pd2; // 借用 intensity 存点到面距离 pd2
+                            res_last[i] = abs(pd2); // 残差绝对值，供 effct_feat_num 筛选（<=2）
                         }
                     }
-                }
+                }//对每个下采样特征点，在「当前位姿 + 当前地图邻域」下算了一个点面残差（pd2 / res_last）和平面法向（存在 normvec）；
                 // cout<<"pca time test: "<<pca_time1<<" "<<pca_time2<<endl;
-                effct_feat_num = 0;
-                laserCloudOri->resize(feats_down_size);
-                corr_normvect->reserve(feats_down_size);
-                for (int i = 0; i < feats_down_size; i++)
+                effct_feat_num = 0; // 有效特征计数清零，下面紧凑装入 laserCloudOri/corr_normvect
+                laserCloudOri->resize(feats_down_size); // 预分配最大可能点数（实际 effct_feat_num 可能更小，后面按索引写入前 effct_feat_num 个）
+                // 须 resize 而非仅 reserve：swap 清空后 points.size() 为 0，否则对 points[effct_feat_num] 赋值越界。有效点 effct_feat_num≤feats_down_size，上界与 laserCloudOri 一致即可。
+                corr_normvect->resize(feats_down_size);
+                for (int i = 0; i < feats_down_size; i++) // 存一下刚刚筛选出来的有效点和相对平面法向量方向统计总残差
                 {
-                    if (point_selected_surf[i] && (res_last[i] <= 2.0))
+                    if (point_selected_surf[i] && (res_last[i] <= 2.0)) // 近邻+平面 OK 且点到面距离足够小
                     {
-                        laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
-                        corr_normvect->points[effct_feat_num] = normvec->points[i];
-                        total_residual += res_last[i];
-                        effct_feat_num ++;
+                        laserCloudOri->points[effct_feat_num] = feats_down_body->points[i]; // 体坐标点拷贝到有效列表
+                        corr_normvect->points[effct_feat_num] = normvec->points[i]; // 对应法向与 pd2
+                        total_residual += res_last[i]; // 累加 |pd2|
+                        effct_feat_num ++; // 有效点数加一
                     }
                 }
 
-                res_mean_last = total_residual / effct_feat_num;
+                res_mean_last = total_residual / effct_feat_num; // 平均残差（注意 effct_feat_num=0 时会除零，依赖上游保证有点）
                 // cout << "[ mapping ]: Effective feature num: "<<effct_feat_num<<" res_mean_last "<<res_mean_last<<endl;
-                match_time  += omp_get_wtime() - match_start;
-                solve_start  = omp_get_wtime();
+                match_time  += omp_get_wtime() - match_start; // 累加本迭代匹配段耗时
+                solve_start  = omp_get_wtime(); // 解算段（建 H、卡尔曼更新）起始时间
                 
                 /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
-                MatrixXd Hsub(effct_feat_num, 6);
-                VectorXd meas_vec(effct_feat_num);
-
-                for (int i = 0; i < effct_feat_num; i++)
+                MatrixXd Hsub(effct_feat_num, 6); // 测量雅可比：每行对应一个点面约束，列数为位姿增量 6 维（角+平移）
+                VectorXd meas_vec(effct_feat_num); // 测量向量 z（此处为 -pd2）
+                // 残差是点到平面的距离
+                for (int i = 0; i < effct_feat_num; i++) // 对每个有效特征构造一行 H 与一个标量测量
                 {
-                    const PointType &laser_p  = laserCloudOri->points[i];
-                    V3D point_this(laser_p.x, laser_p.y, laser_p.z);
-                    point_this = Lidar_rot_to_IMU*point_this + Lidar_offset_to_IMU;
-                    M3D point_crossmat;
-                    point_crossmat<<SKEW_SYM_MATRX(point_this);
+                    const PointType &laser_p  = laserCloudOri->points[i]; // 体坐标系下的激光点
+                    V3D point_this(laser_p.x, laser_p.y, laser_p.z); // 转 Eigen
+                    point_this = Lidar_rot_to_IMU*point_this + Lidar_offset_to_IMU; // 雷达到 IMU 外参：点变到 IMU 系
+                    M3D point_crossmat; // 反对称矩阵 [p]_×，用于对旋转求导
+                    point_crossmat<<SKEW_SYM_MATRX(point_this); // 填充反对称
 
                     /*** get the normal vector of closest surface/corner ***/
-                    const PointType &norm_p = corr_normvect->points[i];
-                    V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
+                    const PointType &norm_p = corr_normvect->points[i]; // 打包的法向与 pd2
+                    V3D norm_vec(norm_p.x, norm_p.y, norm_p.z); // 单位法向 n
 
                     /*** calculate the Measuremnt Jacobian matrix H ***/
-                    V3D A(point_crossmat * state.rot_end.transpose() * norm_vec);
-                    Hsub.row(i) << VEC_FROM_ARRAY(A), norm_p.x, norm_p.y, norm_p.z;
+                    V3D A(point_crossmat * state.rot_end.transpose() * norm_vec); // 对李代数旋转部分的链式导数块  有效激光点在IMU系下的坐标反对称矩阵*当前姿态的转制*法向量
+                    Hsub.row(i) << VEC_FROM_ARRAY(A), norm_p.x, norm_p.y, norm_p.z; // 行 = [A(3), n(3)]，对 6 维位姿增量的雅可比
 
                     /*** Measuremnt: distance to the closest surface/corner ***/
-                    meas_vec(i) = - norm_p.intensity;
+                    meas_vec(i) = - norm_p.intensity; // 观测取负的点到面距离（与残差定义一致）
                 }
-                solve_const_H_time += omp_get_wtime() - solve_start;
+                //在这里构造好了每一个有效点和有效点到面的距离。也构造了有效点的旋转和平移对有效点到面的距离影响的敏感度
+                solve_const_H_time += omp_get_wtime() - solve_start; // 统计「构造 H/z」耗时
 
-                MatrixXd K(DIM_STATE, effct_feat_num);
+                MatrixXd K(DIM_STATE, effct_feat_num); // 全维卡尔曼增益矩阵占位（本段后未显式赋值，K_sum 行为调试用/遗留）
 
-                EKF_stop_flg = false;
-                flg_EKF_converged = false;
+                EKF_stop_flg = false; // 本迭代先假设不停止 EKF
+                flg_EKF_converged = false; // 本迭代先假设未收敛
                 
                 /*** Iterative Kalman Filter Update ***/
-                if (!flg_EKF_inited)
+                if (!flg_EKF_inited) // 理论上与 for 条件矛盾，通常为遗留分支：LiDAR 初始化姿态
                 {
-                    cout<<"||||||||||Initiallizing LiDar||||||||||"<<endl;
+                    cout<<"||||||||||Initiallizing LiDar||||||||||"<<endl; // 打印初始化提示
                     /*** only run in initialization period ***/
-                    MatrixXd H_init(MD(9, DIM_STATE)::Zero());
-                    MatrixXd z_init(VD(9)::Zero());
-                    H_init.block<3,3>(0,0)  = M3D::Identity();
-                    H_init.block<3,3>(3,3)  = M3D::Identity();
-                    H_init.block<3,3>(6,15) = M3D::Identity();
-                    z_init.block<3,1>(0,0)  = - Log(state.rot_end);
-                    z_init.block<3,1>(0,0)  = - state.pos_end;
+                    MatrixXd H_init(MD(9, DIM_STATE)::Zero()); // 9 维伪观测对全状态的初始化 H
+                    MatrixXd z_init(VD(9)::Zero()); // 9 维伪观测向量
+                    H_init.block<3,3>(0,0)  = M3D::Identity(); // 前 3 维对旋转块
+                    H_init.block<3,3>(3,3)  = M3D::Identity(); // 中间 3 维对平移块（与上行块在列上重叠布局，按原作者设计）
+                    H_init.block<3,3>(6,15) = M3D::Identity(); // 后 3 维对重力等状态块（列 15 起）
+                    z_init.block<3,1>(0,0)  = - Log(state.rot_end); // 旋转对数映射到向量（随后一行覆盖同一块的部分语义）
+                    z_init.block<3,1>(0,0)  = - state.pos_end; // 再次写 z_init 前 3 维为 -pos（上一行被覆盖，属源码级重复赋值）
 
-                    auto H_init_T = H_init.transpose();
+                    auto H_init_T = H_init.transpose(); // H^T
                     auto &&K_init = state.cov * H_init_T * (H_init * state.cov * H_init_T + \
-                                    0.0001 * MD(9, 9)::Identity()).inverse();
-                    solution      = K_init * z_init;
+                                    0.0001 * MD(9, 9)::Identity()).inverse(); // 初始化卡尔曼增益形式
+                    solution      = K_init * z_init; // 全状态增量解（此处未直接 state+=，见下）
 
                     // solution.block<9,1>(0,0).setZero();
                     // state += solution;
                     // state.cov = (MatrixXd::Identity(DIM_STATE, DIM_STATE) - K_init * H_init) * state.cov;
 
-                    state.resetpose();
-                    EKF_stop_flg = true;
+                    state.resetpose(); // 用内部逻辑重置位姿（与 FAST-LIO 初始化衔接）
+                    EKF_stop_flg = true; // 标记本帧 EKF 迭代结束
                 }
-                else
+                else // 正常 IESKF 更新分支
                 {
-                    auto &&Hsub_T = Hsub.transpose();
-                    auto &&HTz = Hsub_T * meas_vec;
-                    H_T_H.block<6,6>(0,0) = Hsub_T * Hsub;
+                    auto &&Hsub_T = Hsub.transpose(); // H^T，effct_feat_num×6 → 6×effct_feat_num
+                    auto &&HTz = Hsub_T * meas_vec; // H^T z，6×1
+                    H_T_H.block<6,6>(0,0) = Hsub_T * Hsub; // 左上角 6×6 存 H^T H（仅位姿块）
                     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
                     MD(DIM_STATE, DIM_STATE) &&K_1 = \
-                            (H_T_H + (state.cov / LASER_POINT_COV).inverse()).inverse();
-                    G.block<DIM_STATE,6>(0,0) = K_1.block<DIM_STATE,6>(0,0) * H_T_H.block<6,6>(0,0);
-                    auto vec = state_propagat - state;
-                    solution = K_1.block<DIM_STATE,6>(0,0) * HTz + vec - G.block<DIM_STATE,6>(0,0) * vec.block<6,1>(0,0);
+                            (H_T_H + (state.cov / LASER_POINT_COV).inverse()).inverse(); // 等价于在信息域融合测量噪声 LASER_POINT_COV
+                    G.block<DIM_STATE,6>(0,0) = K_1.block<DIM_STATE,6>(0,0) * H_T_H.block<6,6>(0,0); // 用于协方差更新的 G 矩阵左块
+                    auto vec = state_propagat - state; // 传播状态与当前估计之差（先验残差）对，是当前帧、以 IMU 传播结果为基准的「状态先验相对当前估计的偏差」（状态域上的残差向量）。
+                    solution = K_1.block<DIM_STATE,6>(0,0) * HTz + vec - G.block<DIM_STATE,6>(0,0) * vec.block<6,1>(0,0); // 全状态增量
 
-                    int minRow, minCol;
-                    if(0)//if(V.minCoeff(&minRow, &minCol) < 1.0f)
+                    int minRow, minCol; // 退化检测预留下标（当前未使用）
+                    if(0)//if(V.minCoeff(&minRow, &minCol) < 1.0f) // 恒为假：关闭退化时的特殊处理
                     {
-                        VD(6) V = H_T_H.block<6,6>(0,0).eigenvalues().real();
-                        cout<<"!!!!!! Degeneration Happend, eigen values: "<<V.transpose()<<endl;
-                        EKF_stop_flg = true;
-                        solution.block<6,1>(9,0).setZero();
+                        VD(6) V = H_T_H.block<6,6>(0,0).eigenvalues().real(); // 若开启则算 H^T H 特征值
+                        cout<<"!!!!!! Degeneration Happend, eigen values: "<<V.transpose()<<endl; // 退化打印
+                        EKF_stop_flg = true; // 停止
+                        solution.block<6,1>(9,0).setZero(); // 将速度等块增量清零（与状态维划分相关）
                     }
 
-                    state += solution;
+                    state += solution; // 误差状态加到名义状态上
 
-                    rot_add = solution.block<3,1>(0,0);
-                    t_add   = solution.block<3,1>(3,0);
+                    rot_add = solution.block<3,1>(0,0); // 旋转增量（李代数 rad）
+                    t_add   = solution.block<3,1>(3,0); // 平移增量（米）
 
-                    if ((rot_add.norm() * 57.3 < 0.01) && (t_add.norm() * 100 < 0.015))
+                    if ((rot_add.norm() * 57.3 < 0.01) && (t_add.norm() * 100 < 0.015)) // 角度转度×100、平移×100 后的阈值判收敛
                     {
-                        flg_EKF_converged = true;
+                        flg_EKF_converged = true; // 标记位姿增量已很小
                     }
 
-                    deltaR = rot_add.norm() * 57.3;
-                    deltaT = t_add.norm() * 100;
+                    deltaR = rot_add.norm() * 57.3; // 供日志/调试的旋转增量（度）
+                    deltaT = t_add.norm() * 100;  // 平移增量（cm 量级缩放）
                 }
-                euler_cur = RotMtoEuler(state.rot_end);
+                euler_cur = RotMtoEuler(state.rot_end); // 更新后欧拉角，供 rematch/协方差块后发布等使用
                 
 
                 /*** Rematch Judgement ***/
-                nearest_search_en = false;
-                if (flg_EKF_converged || ((rematch_num == 0) && (iterCount == (NUM_MAX_ITERATIONS - 2))))
+                nearest_search_en = false; // 默认本迭代结束不再搜近邻
+                if (flg_EKF_converged || ((rematch_num == 0) && (iterCount == (NUM_MAX_ITERATIONS - 2)))) // 收敛或倒数第二轮且尚未 rematch
                 {
-                    nearest_search_en = true;
-                    rematch_num ++;
+                    nearest_search_en = true; // 下一轮 for 内层将对每个点重新 kNN
+                    rematch_num ++; // rematch 次数加一
                 }
 
                 /*** Convergence Judgements and Covariance Update ***/
-                if (!EKF_stop_flg && (rematch_num >= 2 || (iterCount == NUM_MAX_ITERATIONS - 1)))
+                if (!EKF_stop_flg && (rematch_num >= 2 || (iterCount == NUM_MAX_ITERATIONS - 1))) // 已 rematch 至少两次或已达最后一轮
                 {
-                    if (flg_EKF_inited)
+                    if (flg_EKF_inited) // 再次确认已初始化（与协方差更新挂钩）
                     {
                         /*** Covariance Update ***/
                         // G.setZero();
                         // G.block<DIM_STATE,6>(0,0) = K * Hsub;
-                        state.cov = (I_STATE - G) * state.cov;
-                        total_distance += (state.pos_end - position_last).norm();
-                        position_last = state.pos_end;
+                        state.cov = (I_STATE - G) * state.cov; // Joseph 形式协方差更新（与上面 G 配套）
+                        total_distance += (state.pos_end - position_last).norm(); // 累计轨迹长度
+                        position_last = state.pos_end; // 记录上一位置
                         geoQuat = tf::createQuaternionMsgFromRollPitchYaw
-                                    (euler_cur(0), euler_cur(1), euler_cur(2));
+                                    (euler_cur(0), euler_cur(1), euler_cur(2)); // 更新四元数供发布
 
-                        VD(DIM_STATE) K_sum  = K.rowwise().sum();
-                        VD(DIM_STATE) P_diag = state.cov.diagonal();
+                        VD(DIM_STATE) K_sum  = K.rowwise().sum(); // 增益矩阵按行求和（调试用；K 未赋值时数值无意义）
+                        VD(DIM_STATE) P_diag = state.cov.diagonal(); // 协方差对角线
                         // cout<<"K: "<<K_sum.transpose()<<endl;
                         // cout<<"P: "<<P_diag.transpose()<<endl;
                         // cout<<"position: "<<state.pos_end.transpose()<<" total distance: "<<total_distance<<endl;
                     }
-                    EKF_stop_flg = true;
+                    EKF_stop_flg = true; // 本帧迭代卡尔曼结束标志
                 }
-                solve_time += omp_get_wtime() - solve_start;
+                solve_time += omp_get_wtime() - solve_start; // 累加解算段耗时
 
-                if (EKF_stop_flg)   break;
+                if (EKF_stop_flg)   break; // 若已要求停止，跳出 iterCount 循环
             }
         }
         

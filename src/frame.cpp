@@ -26,7 +26,7 @@
 
 namespace lidar_selection {
 
-int Frame::frame_counter_ = 0; 
+int Frame::frame_counter_ = 0; //没有适配长期使用。没有置零最大65536
 
 Frame::Frame(vk::AbstractCamera* cam, const cv::Mat& img) :
     id_(frame_counter_++), 
@@ -78,12 +78,14 @@ void Frame::setKeyPoints()
   std::for_each(fts_.begin(), fts_.end(), [&](FeaturePtr ftr){ if(ftr->point != nullptr) checkKeyPoints(ftr); });
 }
 
+// 从「已挂 3D 点」的特征里维护 5 个代表点 key_pts_，供快速判断与其它帧视场是否重叠。
+// 调用方需保证 ftr->point 非空。图像坐标原点在左上，x 向右、y 向下；(cu,cv) 为图像中心。
 void Frame::checkKeyPoints(FeaturePtr ftr)
 {
   const int cu = cam_->width()/2;
   const int cv = cam_->height()/2;
 
-  // center pixel
+  // key_pts_[0]：在整幅图中选「离中心最近」的特征（Chebyshev 距离 max(|dx|,|dy|) 最小）。  多次调用迭代寻找阿最近的
   if(key_pts_[0] == nullptr)
     key_pts_[0] = ftr;
 
@@ -91,6 +93,7 @@ void Frame::checkKeyPoints(FeaturePtr ftr)
         < std::max(std::fabs(key_pts_[0]->px[0]-cu), std::fabs(key_pts_[0]->px[1]-cv)))
     key_pts_[0] = ftr;
 
+  // key_pts_[1]：图像右下区域（x>=cu 且 y>=cv）。用 (x-cu)*(y-cv) 衡量相对中心朝右下「张开」程度，越大越靠外。
   if(ftr->px[0] >= cu && ftr->px[1] >= cv)
   {
     if(key_pts_[1] == nullptr)
@@ -100,6 +103,7 @@ void Frame::checkKeyPoints(FeaturePtr ftr)
       key_pts_[1] = ftr;
   }
 
+  // key_pts_[2]：图像右上区域（x>=cu 且 y<cv）。用 (x-cu)*(cv-y)，越大越靠近该角外侧。
   if(ftr->px[0] >= cu && ftr->px[1] < cv)
   {
     if(key_pts_[2] == nullptr)
@@ -111,6 +115,7 @@ void Frame::checkKeyPoints(FeaturePtr ftr)
       key_pts_[2] = ftr;
   }
 
+  // key_pts_[3]：图像左上区域（x<cu 且 y<cv）。(x-cu)*(y-cv) 两因子均负则积为正，越大越靠该角外侧。
   if(ftr->px[0] < cu && ftr->px[1] < cv)
   {
     if(key_pts_[3] == nullptr)
@@ -120,6 +125,8 @@ void Frame::checkKeyPoints(FeaturePtr ftr)
       key_pts_[3] = ftr;
   }
 
+  // key_pts_[4]：图像左下区域（x<cu 且 y>=cv）。意图与其它角类似：用 (cu-x)*(y-cv) 衡量朝左下角「张开」程度。
+  // 注意：下行左侧按运算符优先级为 cu - px*(py-cv)，与右侧 (cu-px)*(py-cv) 形式不对称，疑为历史笔误。
   if(ftr->px[0] < cu && ftr->px[1] >= cv)  
   // if(ftr->px[0] < cv && ftr->px[1] >= cv)
   {
@@ -145,9 +152,9 @@ void Frame::removeKeyPoint(FeaturePtr ftr)
     setKeyPoints();
 }
 
-bool Frame::isVisible(const Vector3d& xyz_w) const
+bool Frame::isVisible(const Vector3d& xyz_w) const//看雷达点是否能被相机观测到。
 {
-  Vector3d xyz_f = T_f_w_*xyz_w;
+  Vector3d xyz_f = T_f_w_*xyz_w;//世界坐标系的点变换到相机坐标系
 
   if(xyz_f.z() < 0.0)
     return false; // point is behind the camera
@@ -171,10 +178,10 @@ void createImgPyramid(const cv::Mat& img_level_0, int n_levels, ImgPyr& pyr)
     pyr[i] = cv::Mat(pyr[i-1].rows/2, pyr[i-1].cols/2, CV_8U);
     vk::halfSample(pyr[i-1], pyr[i]);
   }
-}
+}//图像金字塔生成，目前没有使用。
 
 
-bool getSceneDepth(const Frame& frame, double& depth_mean, double& depth_min)
+bool getSceneDepth(const Frame& frame, double& depth_mean, double& depth_min)//获取场景深度 目前没有使用。
 {
   vector<double> depth_vec;
   depth_vec.reserve(frame.fts_.size());

@@ -1,0 +1,104 @@
+================================================================================
+Frame 相关问答汇总（基于 FAST-LIVO 中 lidar_selection 模块的 frame.h / frame.cpp）
+整理自对话中的问题与结论，便于日后查阅。
+================================================================================
+
+一、frame.cpp / Frame 类主要在做什么？
+--------------------------------------------------------------------------------
+1）帧初始化：校验灰度图尺寸与相机模型一致，维护 img_pyr_（当前实现常
+   仅放入第 0 层原图，完整金字塔构建代码被注释）。
+2）特征列表：通过 addFeature 维护 fts_，一帧可有大量特征，并非只有 5 个。
+3）代表点 key_pts_（固定 5 个槽位）：从「已关联 3D 点」的特征中按几何规则
+   选出中心 + 四象限的代表点，用于快速判断与其它关键帧视场是否重叠；
+   维护接口：setKeyframe、setKeyPoints、checkKeyPoints、removeKeyPoint。
+4）可见性：isVisible(xyz_w) 判断世界系 3D 点是否在本帧相机前方且投影在
+   图像范围内。
+5）工具函数（frame_utils）：createImgPyramid（半采样建塔）、getSceneDepth
+   （由带 3D 的观测统计深度中位数与最小值）。
+
+注意：「两帧是否重叠」的循环逻辑在 map.cpp 的 Map::getCloseKeyframes 中：
+对关键帧的 key_pts_ 调用当前 frame 的 isVisible(代表点对应 3D)。Frame 提供
+数据与几何接口，并非「只有 frame.cpp 负责重叠判断」。
+
+
+二、「只提取五个特征点」的澄清
+--------------------------------------------------------------------------------
+- key_pts_ 的「5」只表示 5 个代表特征槽位，用于视场重叠等快速判断。
+- 整帧特征在 fts_ 里，由 lidar_selection（如 addFromSparseMap、addSparseMap、
+  addObservation）添加，数量通常远多于 5。
+- 若希望整帧真的只用 5 个特征，需改稀疏图/网格/选点策略，而非只改 key_pts_。
+
+
+三、boost::noncopyable 的含义
+--------------------------------------------------------------------------------
+继承 boost::noncopyable 表示禁止拷贝构造与拷贝赋值，避免整帧按值拷贝
+（图像、特征、相机指针等）带来的性能与所有权问题。Frame 通常用 FramePtr
+(shared_ptr) 传递。「Frame::」里的 Frame 是类名，不是命名空间。
+
+
+四、命名空间 lidar_selection（写在类外）
+--------------------------------------------------------------------------------
+namespace 包在类外，用于模块级符号隔离：避免 Frame、Feature、Point 等与
+其它库或本工程其它模块同名冲突，并标明属于 LiDAR 选点/视觉子模块。
+类外的 namespace 不是用来替代类成员的，而是给一批类型与函数统一前缀。
+
+
+五、Frame::frame_counter_ 与 int Frame::frame_counter_ = 0;
+--------------------------------------------------------------------------------
+- frame_counter_ 在类内声明为 static int，表示全类共享一份计数器，不是某个
+  实例独有。
+- 在 .cpp 中写「int Frame::frame_counter_ = 0;」是静态数据成员的唯一定义：
+  类型 int、属于类 Frame、可带初值；定义行不再写 static（static 只在类内
+  声明出现）。
+- 执行 Frame::frame_counter_ = 0 改的是「全局共享计数器」，已创建实例的
+  id_ 不会变；影响之后新构造的 Frame 的 id_ 从何处递增。
+
+
+六、initFrame（frame.cpp 约 45–60 行）在做什么？
+--------------------------------------------------------------------------------
+1）检查图像非空、CV_8UC1、行列与 cam_ 一致，否则抛异常。
+2）注释意图是清空 key_pts_，但 for_each 里 lambda 参数若为 FeaturePtr 按值
+  传递，则 ftr=nullptr 只改拷贝，可能无法真正清空 key_pts_；若需清空应使用
+  FeaturePtr& 或按下标赋值。
+3）清空 img_pyr_ 后 push_back(img)，仅第 0 层；多层金字塔调用被注释。
+
+
+七、vk::AbstractCamera* cam 传入的是什么？
+--------------------------------------------------------------------------------
+指向 vikit 相机几何模型（内参 + 投影/反投影）的多态基类指针。本工程中由
+laserMapping.cpp 调用 vk::camera_loader::loadFromRosNs("laserMapping",
+lidar_selector->cam) 根据 ROS 参数创建派生类对象；LidarSelector::detect 里
+new Frame(cam, img.clone()) 传入的是同一 LidarSelector::cam。
+
+基类 AbstractCamera 至少含 width_、height_、scale_ 及虚函数 cam2world、
+world2cam 等。常见派生类 PinholeCamera 另含 fx、fy、cx、cy、畸变系数、K 矩阵
+等；具体类型由加载配置决定。
+
+
+八、FeaturePtr 里有什么？
+--------------------------------------------------------------------------------
+FeaturePtr = std::shared_ptr<Feature>。
+- shared_ptr 自身：引用计数 + 指向 Feature 的指针。
+- Feature 结构体主要字段：id_、type（CORNER/EDGELET）、frame、img、ImgPyr、
+  px（像素）、f（单位视线）、level、point（关联 3D 地图点）、grad、score、
+  error、T_f_w_（观测时相机位姿）等；构造函数只初始化其中一部分，其余在
+  创建 Feature 的代码路径中赋值。
+
+
+九、图像金字塔是什么？
+--------------------------------------------------------------------------------
+同一张图的多组分辨率版本：第 0 层为原图，往上每层宽高约减半，由下层下采样
+得到。用途包括由粗到细的光流/对齐、多尺度特征、加速计算等。
+本工程中 Frame::img_pyr_ 为 vector<cv::Mat>；当前 initFrame 常仅保留第 0 层；
+frame_utils::createImgPyramid 可用 halfSample 建多层。Feature::ImgPyr 表示
+特征 patch 的多层图像（若被赋值）。
+
+
+十、头文件 frame.h 备注
+--------------------------------------------------------------------------------
+末尾注释若仍写「namespace svo」而实际为 lidar_selection，属历史拷贝笔误，
+以 namespace lidar_selection 为准。
+
+================================================================================
+文件路径：docs/frame_问答汇总.txt
+================================================================================

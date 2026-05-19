@@ -769,6 +769,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
     // 反向：点乘为负数
     //叉乘
     // 叉乘向量 同时垂直于 a 和 b
+    
     //旋转矩阵左乘是世界坐标系里面描述旋转。右乘是机体坐标系里面描述旋转。
     // F_x：DIM_STATE×DIM_STATE（18×18）误差状态转移矩阵。先 setIdentity()，下面只对非平凡子块赋值，其余维度当一步内不耦合。
     F_x.setIdentity();
@@ -851,7 +852,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   if (pcl_out.points.size() < 1) return;
   /*** undistort each lidar point (backward propagation) ***/
   // 从「扫描结束时刻」往「扫描开始」反向遍历点；curvature 存的是该点时间戳（ms），与 IMUpose 的 offset_time 对齐
-  auto it_pcl = pcl_out.points.end() - 1;
+  auto it_pcl = pcl_out.points.end() - 1;//为什么end（）-1，因为end（）是最后一个元素的下一个位置，所以-1是最后一个元素。原因：没有元素时：begin() == end()，一行就能判断「空」。若 end() 指向最后一个元素，空容器时 end() 指哪？会很难统一。「在末尾插入」就是 insert(end(), x)子区间 [first, last) 里 last 常常就是 end()，和「长度 = last - first」一致。
   for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
   {
     auto head = it_kp - 1; // 该 IMU 积分段的起点（较早时刻）
@@ -864,22 +865,23 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
     angvel_avr<<VEC_FROM_ARRAY(head->gyr);
 
     // 本段内所有时间戳晚于 head 的点：从 head 时刻用常角速度积分 dt 到点时刻
-    for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
+    for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)//矫正所有畸变的点在imu起始点之后的点
     {
-      dt = it_pcl->curvature / double(1000) - head->offset_time;
+      dt = it_pcl->curvature / double(1000) - head->offset_time;//当前帧雷达信息和初始帧雷达时间偏移，减去 （所以点云跟着imu动没有一个点云不被改变），把激光雷达的点的时间都转移到imu的时间上来实现时间对齐。
 
       /* Transform to the 'end' frame, using only the rotation
        * Note: Compensation direction is INVERSE of Frame's moving direction
        * So if we want to compensate a point at timestamp-i to the frame-e
        * P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei) where T_ei is represented in global frame */
       // R_i：从 head 姿态再前向积分 dt，得到「点采集时刻」IMU 姿态（世界系下）
-      M3D R_i(R_imu * Exp(angvel_avr, dt));
+      M3D R_i(R_imu * Exp(angvel_avr, dt));//当时角度乘角速度平均和李代数时间积分。时间是imu到点的时间差。 点比imu头晚到 积分积分，每个点只是在他那个时刻转一下，不是从头转到尾。
       // T_ei：点时刻 IMU 位置相对帧末 IMU 位置的平移（世界系），与 R_i 一起把点变到「帧末 IMU」下
       V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - state_inout.pos_end);
+      //世界系里、从「扫尾 IMU 原点」指向「点时刻 IMU 原点」的位移向量（谁减谁决定箭头方向；后面和 R_i、外参组合时，整套公式是自洽的）。
 
       V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
       // Lid_rot_to_IMU*P_i+Lid_offset_to_IMU：雷达点 → IMU 系；R_i*...+T_ei：IMU 系下对齐到帧末；再乘 extR_Ri、减 exrR_extT 回到雷达系表达
-      V3D P_compensate = (extR_Ri * (R_i * (Lid_rot_to_IMU * P_i + Lid_offset_to_IMU) + T_ei) - exrR_extT);
+      V3D P_compensate = (extR_Ri * (R_i * (Lid_rot_to_IMU * P_i + Lid_offset_to_IMU) + T_ei) - exrR_extT);//先雷达转到imu坐标系进行变换，然后再转回雷达坐标系。
 
       /// save Undistorted points and their rotation
       it_pcl->x = P_compensate(0);
